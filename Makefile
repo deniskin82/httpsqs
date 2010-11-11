@@ -1,4 +1,4 @@
-CFLAGS=-Wall -Wextra -I../ydb/root -ggdb -O0
+CFLAGS=-Wall -Wextra -I../ydb/root -ggdb -O3
 LDFLAGS=-L../ydb/root -lydb -levent
 
 all: httpsqs

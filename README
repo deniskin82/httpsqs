@@ -1,0 +1,25 @@
+HTTPSQS is a Simple Queue Service based on HTTP GET/POST protocol.
+This is free software, and you are welcome to modify and redistribute it under the New BSD License.
+
+This is a fork of Zhang Yan's original HTTPSQS project with an aim to clean up and modularize
+code so new backend storage types can be experimented with.
+
+The current revision users YDB instead of Tokyo Cabinet.
+
+Changes in this fork:
+---------------------
+ * All informational responses are in JSON
+ * UIDs are 64bit integers, rather than the original cyclic IDs
+ * Queue information is stored in-memory and not persisted
+
+Features which will be implemented:
+-----------------------------------
+ * Pluggable storage backends allowing for YDB, TokyoCabinet, filesystem etc.
+ * Queue information will be persisted, allowing for restarts & crashes
+
+
+References:
+-----------
+ YDB - http://code.google.com/p/ydb/
+ Tokyo Cabinet - http://www.1978th.net/tokyocabinet/
+ Original HTTPSQS - http://code.google.com/p/httpsqs/
