@@ -3,7 +3,7 @@ LDFLAGS=-L../ydb/root -lydb -levent
 
 all: httpsqs
 
-httpsqs: httpsqs.o
+httpsqs: httpsqs.o rbtree.o
 	$(CXX) -o httpsqs $+ $(LDFLAGS) 
 
 clean:

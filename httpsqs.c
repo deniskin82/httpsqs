@@ -74,8 +74,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define SQS_VERSION "1.3.2.panda"
 
-//using namespace Lux::IO;
-
 YDB httpsqs_db_tcbdb;
 const char *httpsqs_settings_pidfile;
 
@@ -91,6 +89,8 @@ struct sqs_queue_status {
 	uint64_t total_get;
 	uint64_t total_put;
 	uint64_t total_info;
+	uint64_t total_get_bytes;
+	uint64_t total_put_bytes;
 	
 	/* RB node */
 	struct rb_node rbnode;
@@ -139,7 +139,9 @@ get_queue_status( const char *name ) {
 	st->count_bytes = 0;
 	
 	st->total_get = 0;
+	st->total_get_bytes = 0;
 	st->total_put = 0;
+	st->total_put_bytes = 0;
 	st->total_info = 0;
 	
 	rb_link_node(&st->rbnode, parent, node);
@@ -299,6 +301,7 @@ handle_get(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 		qs->tail_id++;
 		qs->count_bytes -= content_length;
 	}			
+	qs->total_get_bytes += content_length;
 	qs->total_get++;
 
 	free(queue_name);
@@ -357,10 +360,11 @@ handle_put(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 	size_t row_size = sizeof(uint8_t) + input_content_type_length + sizeof(uint32_t) + input_data_length;
 
 	ydb_add(httpsqs_db_tcbdb, queue_name, strlen(queue_name), (char*)EVBUFFER_DATA(row), row_size);
-	qs->count = qs->count + 1;;
+	qs->count++;
 	qs->count_bytes += row_size;
-	qs->total_put = qs->total_put + 1;
-	qs->head_id = qs->head_id + 1;
+	qs->total_put_bytes += row_size;
+	qs->total_put++;	
+	qs->head_id++;
 
 	free(queue_name);
 	evbuffer_free(row);
