@@ -1,9 +1,9 @@
-CFLAGS=-Wall -Wextra -I../ydb/root -ggdb -O3
+CFLAGS=-Wall -I../ydb/root -ggdb -O0
 LDFLAGS=-L../ydb/root -lydb -levent
 
 all: httpsqs
 
-httpsqs: httpsqs.o rbtree.o
+httpsqs: db_ydb.o httpsqs.o rbtree.o 
 	$(CXX) -o httpsqs $+ $(LDFLAGS) 
 
 clean:

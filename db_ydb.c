@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "httpsqs.h"
 #include "rbtree.h"

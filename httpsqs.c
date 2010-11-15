@@ -44,6 +44,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sys/types.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,56 +70,74 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <event.h>
 #include <evhttp.h>
 
-#include "ydb.h"
-#include "rbtree.h"
+#include "httpsqs.h"
 
-#define SQS_VERSION "1.3.2.panda"
+struct httpsqs*
+httpsqs_init(void) {
+	struct httpsqs* n = malloc(sizeof(struct httpsqs));	
+	assert( n != NULL );
+	memset(n, 0, sizeof(struct httpsqs));
+	TAILQ_INIT(&n->params);
+	n->queues = RB_ROOT;	
+	return n;
+}
 
-YDB httpsqs_db_tcbdb;
-const char *httpsqs_settings_pidfile;
+int
+httpsqs_set_option(struct httpsqs* h, const char *name, const char *value) {
+	return evhttp_add_header(&h->params, name, value);
+}
 
-struct sqs_queue_status {
-	char *name;
-	uint64_t tail_id;
-	uint64_t head_id;
-	uint32_t maxqueue;
-	uint32_t count;
-	uint64_t count_bytes;
+const char *
+httpsqs_get_option(struct httpsqs* h, const char *name, const char *default_value) {
+	const char *value = evhttp_find_header(&h->params, name);
+	if( value == NULL ) return default_value;
+	return value;
+}
+
+int
+httpsqs_get_option_bool(struct httpsqs* h, const char *name, int default_value) {
+	const char *value = httpsqs_get_option(h, name, NULL);
+	if( value == NULL ) {
+		return default_value;
+	}
 	
-	/* Totals for the lifetime of the queue */
-	uint64_t total_get;
-	uint64_t total_put;
-	uint64_t total_info;
-	uint64_t total_get_bytes;
-	uint64_t total_put_bytes;
-	
-	/* RB node */
-	struct rb_node rbnode;
-};
+	if( strcasecmp(value,"true") == 0 ) return 1==1;
+	if( strcmp(value,"1") == 0 ) return 1==1;
+	return 1==0;
+}
 
-struct rb_root sqs_queues_tree = RB_ROOT;
+int
+httpsqs_get_option_int(struct httpsqs *h, const char *name, int default_value) {
+	const char *value = httpsqs_get_option(h, name, NULL);
+	if( value == NULL ) {
+		return default_value;
+	}
+	
+	return atoi(value);
+}
 
 #define MIN(a,b) ((a) <= (b)? (a) : (b))
 static int key_cmp(const char *a, int a_sz, const char *b, int b_sz) {
-        int r = memcmp(a, b, MIN(a_sz, b_sz));
-        if(r == 0) {
-                if(a_sz == b_sz)
-                        return(0);
-                if(a_sz < b_sz)
-                        return(-1);
-                return(1);
-        }
-        return(r);
+	int r = memcmp(a, b, MIN(a_sz, b_sz));
+	if(r == 0) {
+		if(a_sz == b_sz)
+			return(0);
+		if(a_sz < b_sz)
+			return(-1);
+		return(1);
+	}
+	return(r);
 }
 
 struct sqs_queue_status*
-get_queue_status( const char *name ) {		
+httpsqs_get_queue( struct httpsqs *h, const char *name ) {	
 	int result = 0; 
 	int name_sz = strlen(name);
-	struct rb_node **node = &(sqs_queues_tree.rb_node), *parent = NULL;
+	struct rb_node **node = &(h->queues.rb_node);
+	struct rb_node *parent = NULL;
 	while( *node ) {
 		struct sqs_queue_status* item = container_of(*node, struct sqs_queue_status, rbnode);
-		result = key_cmp(name, name_sz, item->name, strlen(item->name));
+		result = key_cmp(name, name_sz, item->name, item->name_sz);
 		
 		parent = *node;
 		if( result < 0 )
@@ -131,7 +150,8 @@ get_queue_status( const char *name ) {
 	
 	struct sqs_queue_status* st;
 	st = malloc(sizeof(struct sqs_queue_status));
-	st->name = strdup(name);
+	strncpy(st->name, name, 10);
+	st->name_sz = name_sz;
 	st->tail_id = 0;
 	st->head_id = 0;
 	st->maxqueue = 100000;
@@ -145,7 +165,7 @@ get_queue_status( const char *name ) {
 	st->total_info = 0;
 	
 	rb_link_node(&st->rbnode, parent, node);
-	rb_insert_color(&st->rbnode, &sqs_queues_tree);
+	rb_insert_color(&st->rbnode, &h->queues);
 		
 	return st;
 }
@@ -201,6 +221,20 @@ show_help(void)
 	fprintf(stderr, b, strlen(b));
 }
 
+struct httpsqs_db *
+httpsqs_get_db(struct httpsqs *h) {
+	assert( h != NULL );
+	assert( h->db != NULL );
+	return h->db;
+}
+
+void*
+httpsqs_get_db_internal(struct httpsqs *h) {
+	struct httpsqs_db *db = httpsqs_get_db(h);
+	assert( db->internal_handle != NULL );
+	return db->internal_handle;
+}
+
 static uint32_t
 httpsqs_maxqueue(struct sqs_queue_status* st, uint32_t httpsqs_input_num) {
 	if( st->count > httpsqs_input_num ) return 0;
@@ -208,8 +242,8 @@ httpsqs_maxqueue(struct sqs_queue_status* st, uint32_t httpsqs_input_num) {
 }
 
 static bool
-httpsqs_reset(struct sqs_queue_status* st) {
-	rb_erase(&st->rbnode, &sqs_queues_tree);
+httpsqs_reset(struct httpsqs* h, struct sqs_queue_status* st) {
+	rb_erase(&st->rbnode, &h->queues);
 	free(st->name);
 	free(st);
 	return true;	
@@ -238,7 +272,7 @@ send_content_length(struct evhttp_request *req, int content_length) {
 }
 
 static void
-handle_get(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args, bool do_remove) {	
+handle_get(struct httpsqs* h, struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args, bool do_remove) {	
 	uint64_t queue_get_value;
 	
 	if (qs->count == 0) {
@@ -261,9 +295,10 @@ handle_get(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 	asprintf(&queue_name, "%s:%llX", qs->name, queue_get_value);
 	
 	char *content = NULL;
-	int content_length = 0;
+	size_t content_length = 0;
 	
-	if( ! ydb_geta(httpsqs_db_tcbdb, queue_name, strlen(queue_name), &content, &content_length) || ! content ) {	
+	struct httpsqs_db *db = httpsqs_get_db(h);
+	if( ! db->get(h, queue_name, strlen(queue_name), &content, &content_length) || ! content ) {	
 		if( arg_id != NULL ) {
 			send_error(req, 500, "404 Not Found", "Could not find ID");
 			return;
@@ -296,7 +331,8 @@ handle_get(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 	free(content);
 	
 	if( do_remove ) {
-		ydb_del(httpsqs_db_tcbdb, queue_name, strlen(queue_name));
+		//ydb_del(httpsqs_db_tcbdb, queue_name, strlen(queue_name));
+		db->del(h, queue_name, strlen(queue_name));
 		qs->count--;	
 		qs->tail_id++;
 		qs->count_bytes -= content_length;
@@ -311,7 +347,7 @@ handle_get(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 }
 
 static void
-handle_put(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
+handle_put(struct httpsqs* h, struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
 	const char *input_data;
 	const char *input_content_type;
 	uint8_t input_content_type_length = 0;
@@ -359,7 +395,9 @@ handle_put(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 	asprintf(&queue_name, "%s:%llX", qs->name, queue_put_value);
 	size_t row_size = sizeof(uint8_t) + input_content_type_length + sizeof(uint32_t) + input_data_length;
 
-	ydb_add(httpsqs_db_tcbdb, queue_name, strlen(queue_name), (char*)EVBUFFER_DATA(row), row_size);
+	struct httpsqs_db *db = httpsqs_get_db(h);
+	db->add(h, queue_name, strlen(queue_name), (char*)EVBUFFER_DATA(row), row_size);
+	//ydb_add(httpsqs_db_tcbdb, queue_name, strlen(queue_name), (char*)EVBUFFER_DATA(row), row_size);
 	qs->count++;
 	qs->count_bytes += row_size;
 	qs->total_put_bytes += row_size;
@@ -377,7 +415,7 @@ handle_put(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkey
 }
 
 static void
-handle_status(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
+handle_status(struct httpsqs* h, struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
 	struct evbuffer *buf = evbuffer_new();
 	qs->total_info++;
 	evhttp_add_header(req->output_headers, "Content-Type", "application/json");	
@@ -390,8 +428,8 @@ handle_status(struct evhttp_request *req, struct sqs_queue_status *qs, struct ev
 }
 
 static void
-handle_reset(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {	
-	if (httpsqs_reset(qs)) {
+handle_reset(struct httpsqs* h, struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {	
+	if (httpsqs_reset(h, qs)) {
 		qs->total_info++;
 		
 		struct evbuffer *buf = evbuffer_new();
@@ -404,14 +442,14 @@ handle_reset(struct evhttp_request *req, struct sqs_queue_status *qs, struct evk
 }
 
 static void
-handle_maxqueue(struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
+handle_maxqueue(struct httpsqs* h, struct evhttp_request *req, struct sqs_queue_status *qs, struct evkeyvalq *args) {
 	qs->total_info++;
 	evhttp_add_header(req->output_headers, "Content-Type", "application/json");	
 	
 	const char *input_maxqueue = evhttp_find_header(args, "num");		
 	int maxqueue = input_maxqueue == NULL ? 0 : atoi(input_maxqueue);
 	if ( maxqueue != 0 && httpsqs_maxqueue(qs, maxqueue) != 0) {
-		handle_status(req, qs, args);
+		handle_status(h, req, qs, args);
 		return;
 	} 	
 
@@ -420,6 +458,7 @@ handle_maxqueue(struct evhttp_request *req, struct sqs_queue_status *qs, struct 
 
 static void
 httpsqs_handler(struct evhttp_request *req, void *arg) {
+	struct httpsqs* h = (struct httpsqs *)arg;
 	char *decode_uri = evhttp_decode_uri(evhttp_request_uri(req));
 	char *uri_query = strchr(decode_uri, '?');
 	char *uri_path = decode_uri;
@@ -441,7 +480,7 @@ httpsqs_handler(struct evhttp_request *req, void *arg) {
 		return;
 	}
 	
-	struct sqs_queue_status *st = get_queue_status(path_queue);
+	struct sqs_queue_status *st = httpsqs_get_queue(h, path_queue);
 	if( st == NULL ) {
 		send_error(req, 404, "Not Found", "The queue couldn't be found");
 		return;
@@ -452,22 +491,22 @@ httpsqs_handler(struct evhttp_request *req, void *arg) {
 	evhttp_add_header(req->output_headers, "Server:", "HTTPsqs/" SQS_VERSION);
 	
 	if( strcmp(path_action,"get") == 0 ) {
-		handle_get(req, st, &httpsqs_http_query, true);
+		handle_get(h, req, st, &httpsqs_http_query, true);
 	}
 	else if( strcmp(path_action,"put") == 0 ) {
-		handle_put(req, st, &httpsqs_http_query);
+		handle_put(h, req, st, &httpsqs_http_query);
 	}
 	else if( strcmp(path_action,"status") == 0 ) {
-		handle_status(req, st, &httpsqs_http_query);
+		handle_status(h, req, st, &httpsqs_http_query);
 	}
 	else if( strcmp(path_action, "reset") == 0 ) {
-		handle_reset(req, st, &httpsqs_http_query);
+		handle_reset(h, req, st, &httpsqs_http_query);
 	}
 	else if( strcmp(path_action, "view") == 0 ) {
-		handle_get(req, st, &httpsqs_http_query, false);
+		handle_get(h, req, st, &httpsqs_http_query, false);
 	}
 	else if( strcmp(path_action, "maxqueue") == 0 ) {
-		handle_maxqueue(req, st, &httpsqs_http_query);
+		handle_maxqueue(h, req, st, &httpsqs_http_query);
 	}
 	else {
 		send_error(req, 404, "Not Found", "Must be one of: get, put, status, reset, view, maxqueue");
@@ -478,72 +517,110 @@ httpsqs_handler(struct evhttp_request *req, void *arg) {
 }
 
 static void
-kill_signal(const int sig) {
-	ydb_sync(httpsqs_db_tcbdb);
-	ydb_close(httpsqs_db_tcbdb);
+kill_signal(int sig, short what, void *arg) {
+	struct httpsqs *h = (struct httpsqs*)h;
+	struct httpsqs_db *db = httpsqs_get_db(h);
+	db->sync(h);
+	db->close(h);
 
-	remove(httpsqs_settings_pidfile);
+	const char *pid_file = httpsqs_get_option(h, "pid_file", NULL);
+	if( pid_file != NULL ) {
+		remove(pid_file);
+	}
 	
     exit(0);
 }
 
+/*
 static void
-sync_signal(const int sig) {
-	ydb_sync(httpsqs_db_tcbdb);
+sync_signal(int sig, short what, void *arg) {
+	struct httpsqs *h = (struct httpsqs*)h;
+	struct httpsqs_db *db = httpsqs_get_db(h);
+	db->sync(h);
+	//ydb_sync(httpsqs_db_tcbdb);
+}
+*/
+
+
+static int
+httpsqs_start( struct httpsqs* h ) {
+	const char *listen_addr = httpsqs_get_option(h, "listen_addr", "0.0.0.0");
+	int listen_port = atoi(httpsqs_get_option(h, "listen_port", "1218"));
+	int timeout = atoi(httpsqs_get_option(h, "libevent_timeout", "3"));
+
+	h->httpd = evhttp_start(listen_addr, listen_port);
+	if (h->httpd == NULL) {
+		fprintf(stderr, "Error: Unable to listen on %s:%d\n\n", listen_addr, listen_port);		
+		return 0;
+	}
+	evhttp_set_timeout(h->httpd, timeout);
+	evhttp_set_gencb(h->httpd, httpsqs_handler, h);
+
+    event_dispatch();
+    evhttp_free(h->httpd);
+	return 1;
 }
 
-int main(int argc, char **argv)
+int
+main(int argc, char **argv)
 {
 	int c;
 
-	const char *httpsqs_settings_listen = "0.0.0.0";
-	int httpsqs_settings_port = 1218;
-	char *httpsqs_settings_datapath = NULL;
-	bool httpsqs_settings_daemon = false;
-	int httpsqs_settings_timeout = 3;
-	httpsqs_settings_pidfile = "/tmp/httpsqs.pid";
-	int httpsqs_ydb_min_log_size = 5;
-	int httpsqs_ydb_overcommit = 3;
+	//const char *httpsqs_settings_listen = "0.0.0.0";
+	//int httpsqs_settings_port = 1218;
+	//char *httpsqs_settings_datapath = NULL;
+	//httpsqs_settings_pidfile = "/tmp/httpsqs.pid";
+	
+	event_init();		
+	struct httpsqs* h = httpsqs_init();
 
     /* process arguments */
     while ((c = getopt(argc, argv, "l:p:x:t:s:c:m:i:dh")) != -1) {
         switch (c) {
         case 'l':
-            httpsqs_settings_listen = strdup(optarg);
+			httpsqs_set_option(h, "http_listen_addr", optarg);
+            //httpsqs_settings_listen = strdup(optarg);
             break;
         case 'p':
-            httpsqs_settings_port = atoi(optarg);
+			httpsqs_set_option(h, "http_listen_port", optarg);
+            //httpsqs_settings_port = atoi(optarg);
             break;
         case 'x':
-            httpsqs_settings_datapath = strdup(optarg);
-			if (access(httpsqs_settings_datapath, W_OK) != 0) {
-				if (access(httpsqs_settings_datapath, R_OK) == 0) {
-					chmod(httpsqs_settings_datapath, S_IWOTH);
+			httpsqs_set_option(h, "data_path", optarg);
+            //httpsqs_settings_datapath = strdup(optarg);
+			if (access(optarg, W_OK) != 0) {
+				if (access(optarg, R_OK) == 0) {
+					chmod(optarg, S_IWOTH);
 				} else {
-					create_multilayer_dir(httpsqs_settings_datapath);
+					create_multilayer_dir(optarg);
 				}
 	
-				if (access(httpsqs_settings_datapath, W_OK) != 0) {
+				if (access(optarg, W_OK) != 0) {
 					fprintf(stderr, "httpsqs database directory not writable\n");
 				}
 			}
             break;
 		case 's':
-			httpsqs_ydb_min_log_size = atoi(optarg);
-			assert( httpsqs_ydb_min_log_size >= 1 );
+			httpsqs_set_option(h, "ydb_min_log_size", optarg);
+			//httpsqs_ydb_min_log_size = atoi(optarg);
+			//assert( httpsqs_ydb_min_log_size >= 1 );
 			break;
 		case 'o':
-			httpsqs_ydb_overcommit = atoi(optarg);
-			assert( httpsqs_ydb_overcommit >= 1);
+			httpsqs_set_option(h, "ydb_overcommit", optarg);
+			//httpsqs_ydb_overcommit = atoi(optarg);
+			//assert( httpsqs_ydb_overcommit >= 1);
 			break;
         case 't':
-            httpsqs_settings_timeout = atoi(optarg);
+			httpsqs_set_option(h, "libevent_timeout", optarg);
+            //httpsqs_settings_timeout = atoi(optarg);
             break;			
         case 'i':
-            httpsqs_settings_pidfile = strdup(optarg);
+			httpsqs_set_option(h, "pid_file", optarg);
+            //httpsqs_settings_pidfile = strdup(optarg);
             break;			
         case 'd':
-            httpsqs_settings_daemon = true;
+			httpsqs_set_option(h, "daemon", "false");
+            //httpsqs_settings_daemon = true;
             break;
 		case 'h':
         default:
@@ -552,19 +629,16 @@ int main(int argc, char **argv)
         }
     }
 	
-	if (httpsqs_settings_datapath == NULL) {
+	if (httpsqs_get_option(h, "data_path", NULL) == NULL) {
 		show_help();
 		fprintf(stderr, "Attention: Please use the indispensable argument: -x <path>\n\n");		
 		exit(1);
 	}
+
+	struct httpsqs_db *db = db_init(h);
+	db->open(h);
 	
-	httpsqs_db_tcbdb = ydb_open(httpsqs_settings_datapath, httpsqs_ydb_overcommit, 1024 * 1024 * httpsqs_ydb_min_log_size, YDB_CREAT);
-	if( ! httpsqs_db_tcbdb ) {
-		fprintf(stderr, "Error: unable to open database!");
-		exit(1);
-	}
-	
-	if( httpsqs_settings_daemon == true ){
+	if( httpsqs_get_option_bool(h, "daemon", 0) ){
         pid_t pid;
 
         /* Fork off the parent process */       
@@ -580,33 +654,23 @@ int main(int argc, char **argv)
 	}
 	
 	FILE *fp_pidfile;
-	fp_pidfile = fopen(httpsqs_settings_pidfile, "w");
+	fp_pidfile = fopen(httpsqs_get_option(h, "pid_file", "/tmp/httpsqs.pid"), "w");
 	fprintf(fp_pidfile, "%d\n", getpid());
 	fclose(fp_pidfile);
 	
 	signal(SIGPIPE, SIG_IGN);
 	
-	signal (SIGINT, kill_signal);
-	signal (SIGKILL, kill_signal);
-	signal (SIGQUIT, kill_signal);
-	signal (SIGTERM, kill_signal);
-	signal (SIGHUP, kill_signal);
+	struct event kill_sig;
+	signal_set(&kill_sig, SIGINT, kill_signal, h);	
+	signal_set(&kill_sig, SIGKILL, kill_signal, h);	
+	signal_set(&kill_sig, SIGQUIT, kill_signal, h);	
+	signal_set(&kill_sig, SIGTERM, kill_signal, h);	
+	signal_set(&kill_sig, SIGHUP, kill_signal, h);	
+	signal_add(&kill_sig, NULL);
 	
-	signal(SIGALRM, sync_signal);
+	//struct event sync_sig;
+	//signal(SIGALRM, sync_signal);
 	
-    struct evhttp *httpd;
-
-    event_init();
-    httpd = evhttp_start(httpsqs_settings_listen, httpsqs_settings_port);
-	if (httpd == NULL) {
-		fprintf(stderr, "Error: Unable to listen on %s:%d\n\n", httpsqs_settings_listen, httpsqs_settings_port);		
-		exit(1);		
-	}
-	
-	evhttp_set_timeout(httpd, httpsqs_settings_timeout);
-    evhttp_set_gencb(httpd, httpsqs_handler, NULL);
-
-    event_dispatch();
-    evhttp_free(httpd);
-    return 0;
+	httpsqs_start(h);
+	return 0;
 }
